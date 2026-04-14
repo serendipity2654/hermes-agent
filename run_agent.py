@@ -27,27 +27,28 @@ import copy
 import hashlib
 import json
 import logging
+
 logger = logging.getLogger(__name__)
 import os
 import random
 import re
 import sys
 import tempfile
-import time
 import threading
-from types import SimpleNamespace
+import time
 import uuid
-from typing import List, Dict, Any, Optional
-from openai import OpenAI
-import fire
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any, Dict, List, Optional
 
-from hermes_constants import get_hermes_home
+import fire
+from openai import OpenAI
 
 # Load .env from ~/.hermes/.env first, then project root as dev fallback.
 # User-managed env files should override stale shell exports on restart.
 from hermes_cli.env_loader import load_hermes_dotenv
+from hermes_constants import get_hermes_home
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -60,54 +61,76 @@ else:
 
 
 # Import our tool system
-from model_tools import (
-    get_tool_definitions,
-    get_toolset_for_tool,
-    handle_function_call,
-    check_toolset_requirements,
+from agent.context_compressor import ContextCompressor
+from agent.display import (
+    KawaiiSpinner,
+    _detect_tool_failure,
 )
-from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
-from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.browser_tool import cleanup_browser
-
-
-from hermes_constants import OPENROUTER_BASE_URL
+from agent.display import (
+    build_tool_preview as _build_tool_preview,
+)
+from agent.display import (
+    get_cute_tool_message as _get_cute_tool_message_impl,
+)
+from agent.display import (
+    get_tool_emoji as _get_tool_emoji,
+)
+from agent.error_classifier import FailoverReason, classify_api_error
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block
-from agent.retry_utils import jittered_backoff
-from agent.error_classifier import classify_api_error, FailoverReason
-from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    build_nous_subscription_prompt,
-)
 from agent.model_metadata import (
+    estimate_messages_tokens_rough,
+    estimate_request_tokens_rough,
+    estimate_tokens_rough,
     fetch_model_metadata,
-    estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
-    get_next_probe_tier, parse_context_limit_from_error,
+    get_next_probe_tier,
+    is_local_endpoint,
     parse_available_output_tokens_from_error,
-    save_context_length, is_local_endpoint,
+    parse_context_limit_from_error,
     query_ollama_num_ctx,
+    save_context_length,
 )
-from agent.context_compressor import ContextCompressor
-from agent.subdirectory_hints import SubdirectoryHintTracker
+from agent.prompt_builder import (
+    DEFAULT_AGENT_IDENTITY,
+    DEVELOPER_ROLE_MODELS,
+    GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    MEMORY_GUIDANCE,
+    OPENAI_MODEL_EXECUTION_GUIDANCE,
+    PLATFORM_HINTS,
+    SESSION_SEARCH_GUIDANCE,
+    SKILLS_GUIDANCE,
+    TOOL_USE_ENFORCEMENT_GUIDANCE,
+    TOOL_USE_ENFORCEMENT_MODELS,
+    build_context_files_prompt,
+    build_environment_hints,
+    build_nous_subscription_prompt,
+    build_skills_system_prompt,
+    load_soul_md,
+)
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
-from agent.display import (
-    KawaiiSpinner, build_tool_preview as _build_tool_preview,
-    get_cute_tool_message as _get_cute_tool_message_impl,
-    _detect_tool_failure,
-    get_tool_emoji as _get_tool_emoji,
+from agent.retry_utils import jittered_backoff
+from agent.subdirectory_hints import SubdirectoryHintTracker
+from agent.trajectory import (
+    convert_scratchpad_to_think,
+    has_incomplete_scratchpad,
 )
 from agent.trajectory import (
-    convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
+from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from hermes_constants import OPENROUTER_BASE_URL
+from model_tools import (
+    check_toolset_requirements,
+    get_tool_definitions,
+    get_toolset_for_tool,
+    handle_function_call,
+)
+from tools.browser_tool import cleanup_browser
+from tools.interrupt import set_interrupt as _set_interrupt
+from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
+from tools.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
 from utils import atomic_json_write, env_var_enabled
-
 
 
 class _SafeWriter:
@@ -814,6 +837,7 @@ class AIAgent:
         self._current_tool: str | None = None
         self._api_call_count: int = 0
 
+        from agent.rate_limit_tracker import RateLimitState
         # Rate limit tracking — updated from x-ratelimit-* response headers
         # after each API call.  Accessed by /usage slash command.
         self._rate_limit_state: Optional["RateLimitState"] = None
@@ -874,7 +898,10 @@ class AIAgent:
         self._is_anthropic_oauth = False
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_token,
+            )
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own API key.
             # Falling back would send Anthropic credentials to third-party endpoints (Fixes #1739, #minimax-401).
@@ -1170,13 +1197,16 @@ class AIAgent:
                 # file may be from a different tool.
                 if not _mem_provider_name:
                     try:
-                        from plugins.memory.honcho.client import HonchoClientConfig as _HCC
+                        from plugins.memory.honcho.client import (
+                            HonchoClientConfig as _HCC,
+                        )
                         _hcfg = _HCC.from_global_config()
                         if _hcfg.enabled and (_hcfg.api_key or _hcfg.base_url):
                             _mem_provider_name = "honcho"
                             # Persist so this only auto-migrates once
                             try:
-                                from hermes_cli.config import load_config as _lc, save_config as _sc
+                                from hermes_cli.config import load_config as _lc
+                                from hermes_cli.config import save_config as _sc
                                 _cfg = _lc()
                                 _cfg.setdefault("memory", {})["provider"] = "honcho"
                                 _sc(_cfg)
@@ -1553,6 +1583,7 @@ class AIAgent:
         turn-scoped).
         """
         import logging
+
         from hermes_cli.providers import determine_api_mode
 
         # ── Determine api_mode if not provided ──
@@ -1573,9 +1604,9 @@ class AIAgent:
         # ── Build new client ──
         if api_mode == "anthropic_messages":
             from agent.anthropic_adapter import (
+                _is_oauth_token,
                 build_anthropic_client,
                 resolve_anthropic_token,
-                _is_oauth_token,
             )
             # Only fall back to ANTHROPIC_TOKEN when the provider is actually Anthropic.
             # Other anthropic_messages providers (MiniMax, Alibaba, etc.) must use their own
@@ -2190,7 +2221,8 @@ class AIAgent:
             prompt = self._SKILL_REVIEW_PROMPT
 
         def _run_review():
-            import contextlib, os as _os
+            import contextlib
+            import os as _os
             review_agent = None
             try:
                 with open(_os.devnull, "w") as _devnull, \
@@ -4599,7 +4631,10 @@ class AIAgent:
             return False
 
         try:
-            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
+            from agent.anthropic_adapter import (
+                build_anthropic_client,
+                resolve_anthropic_token,
+            )
 
             new_token = resolve_anthropic_token()
         except Exception as exc:
@@ -4651,7 +4686,7 @@ class AIAgent:
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
+            from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
 
             try:
                 self._anthropic_client.close()
@@ -5647,7 +5682,11 @@ class AIAgent:
 
             if fb_api_mode == "anthropic_messages":
                 # Build native Anthropic client instead of using OpenAI client
-                from agent.anthropic_adapter import build_anthropic_client, resolve_anthropic_token, _is_oauth_token
+                from agent.anthropic_adapter import (
+                    _is_oauth_token,
+                    build_anthropic_client,
+                    resolve_anthropic_token,
+                )
                 effective_key = (fb_client.api_key or resolve_anthropic_token() or "") if fb_provider == "anthropic" else (fb_client.api_key or "")
                 self.api_key = effective_key
                 self._anthropic_api_key = effective_key
@@ -6679,7 +6718,9 @@ class AIAgent:
                 response = self._run_codex_stream(codex_kwargs)
             elif not _aux_available and self.api_mode == "anthropic_messages":
                 # Native Anthropic — use the Anthropic client directly
-                from agent.anthropic_adapter import build_anthropic_kwargs as _build_ant_kwargs
+                from agent.anthropic_adapter import (
+                    build_anthropic_kwargs as _build_ant_kwargs,
+                )
                 ant_kwargs = _build_ant_kwargs(
                     model=self.model, messages=api_messages,
                     tools=[memory_tool_def], max_tokens=5120,
@@ -6707,7 +6748,9 @@ class AIAgent:
                 if assistant_msg and assistant_msg.tool_calls:
                     tool_calls = assistant_msg.tool_calls
             elif self.api_mode == "anthropic_messages" and not _aux_available:
-                from agent.anthropic_adapter import normalize_anthropic_response as _nar_flush
+                from agent.anthropic_adapter import (
+                    normalize_anthropic_response as _nar_flush,
+                )
                 _flush_msg, _ = _nar_flush(response, strip_tool_prefix=self._is_anthropic_oauth)
                 if _flush_msg and _flush_msg.tool_calls:
                     tool_calls = _flush_msg.tool_calls
@@ -7272,7 +7315,9 @@ class AIAgent:
                 if not self._session_db:
                     function_result = json.dumps({"success": False, "error": "Session database not available."})
                 else:
-                    from tools.session_search_tool import session_search as _session_search
+                    from tools.session_search_tool import (
+                        session_search as _session_search,
+                    )
                     function_result = _session_search(
                         query=function_args.get("query", ""),
                         role_filter=function_args.get("role_filter"),
@@ -7521,7 +7566,10 @@ class AIAgent:
         For CLI: prints a formatted line with a progress bar.
         For gateway: fires status_callback so the platform can send a chat message.
         """
-        from agent.display import format_context_pressure, format_context_pressure_gateway
+        from agent.display import (
+            format_context_pressure,
+            format_context_pressure_gateway,
+        )
 
         threshold_pct = compressor.threshold_tokens / compressor.context_length if compressor.context_length else 0.5
 
@@ -7627,7 +7675,10 @@ class AIAgent:
                     summary_kwargs["extra_body"] = summary_extra_body
 
                 if self.api_mode == "anthropic_messages":
-                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak, normalize_anthropic_response as _nar
+                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak
+                    from agent.anthropic_adapter import (
+                        normalize_anthropic_response as _nar,
+                    )
                     _ant_kw = _bak(model=self.model, messages=api_messages, tools=None,
                                    max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
                                    is_oauth=self._is_anthropic_oauth,
@@ -7659,7 +7710,10 @@ class AIAgent:
                     retry_msg, _ = self._normalize_codex_response(retry_response)
                     final_response = (retry_msg.content or "").strip() if retry_msg else ""
                 elif self.api_mode == "anthropic_messages":
-                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak2, normalize_anthropic_response as _nar2
+                    from agent.anthropic_adapter import build_anthropic_kwargs as _bak2
+                    from agent.anthropic_adapter import (
+                        normalize_anthropic_response as _nar2,
+                    )
                     _ant_kw2 = _bak2(model=self.model, messages=api_messages, tools=None,
                                     is_oauth=self._is_anthropic_oauth,
                                     max_tokens=self.max_tokens, reasoning_config=self.reasoning_config,
@@ -8463,7 +8517,7 @@ class AIAgent:
                         elif _resp_error_code == 504:
                             _failure_hint = f"upstream gateway timeout (504, {api_duration:.0f}s)"
                         elif _resp_error_code == 429:
-                            _failure_hint = f"rate limited by upstream provider (429)"
+                            _failure_hint = "rate limited by upstream provider (429)"
                         elif _resp_error_code in (500, 502):
                             _failure_hint = f"upstream server error ({_resp_error_code}, {api_duration:.0f}s)"
                         elif _resp_error_code in (503, 529):
@@ -10652,7 +10706,11 @@ def main(
     
     # Handle tool listing
     if list_tools:
-        from model_tools import get_all_tool_names, get_toolset_for_tool, get_available_toolsets
+        from model_tools import (
+            get_all_tool_names,
+            get_available_toolsets,
+            get_toolset_for_tool,
+        )
         from toolsets import get_all_toolsets, get_toolset_info
         
         print("📋 Available Tools & Toolsets:")
