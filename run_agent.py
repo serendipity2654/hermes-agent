@@ -39,7 +39,6 @@ import copy
 import hashlib
 import json
 import logging
-
 logger = logging.getLogger(__name__)
 import os
 import random
@@ -47,10 +46,13 @@ import re
 import ssl
 import sys
 import tempfile
+import time
 import threading
+from types import SimpleNamespace
 import urllib.request
 import uuid
-
+from typing import List, Dict, Any, Optional
+from urllib.parse import urlparse, parse_qs, urlunparse
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # SDK pulls ~240 ms of imports. We expose `OpenAI` as a thin proxy object
 # that imports the SDK on first call/isinstance check. This preserves:
@@ -65,29 +67,28 @@ import uuid
 # ModuleNotFoundError on broken/partial installs where `fire` isn't present.
 from datetime import datetime
 from pathlib import Path
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse, urlunparse
 
-from agent.iteration_budget import IterationBudget
+from hermes_constants import get_hermes_home
 
 # OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
 # `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
 from agent.process_bootstrap import (
     OpenAI,
-    _get_proxy_for_base_url,
-    _get_proxy_from_env,
-    _install_safe_stdio,
-    _load_openai_cls,
     _OpenAIProxy,
+    _load_openai_cls,
     _SafeWriter,
+    _install_safe_stdio,
+    _get_proxy_from_env,
+    _get_proxy_for_base_url,
 )
+from agent.iteration_budget import IterationBudget
+
+
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.timeouts import (
     get_provider_request_timeout,
     get_provider_stale_timeout,
 )
-from hermes_constants import get_hermes_home
 
 _hermes_home = get_hermes_home()
 _project_env = Path(__file__).parent / '.env'
@@ -100,103 +101,60 @@ else:
 
 
 # Import our tool system
-from agent.codex_responses_adapter import (
-    _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
+from model_tools import (
+    get_tool_definitions,
+    get_toolset_for_tool,
+    handle_function_call,
+    check_toolset_requirements,
 )
-from agent.codex_responses_adapter import (
-    _deterministic_call_id as _codex_deterministic_call_id,
+from tools.terminal_tool import cleanup_vm, get_active_env, is_persistent_env
+from tools.terminal_tool import (
+    set_approval_callback as _set_approval_callback,
+    set_sudo_password_callback as _set_sudo_password_callback,
+    _get_approval_callback,
+    _get_sudo_password_callback,
 )
-from agent.codex_responses_adapter import (
-    _split_responses_tool_id as _codex_split_responses_tool_id,
-)
-from agent.codex_responses_adapter import (
-    _summarize_user_message_for_log,
-)
-from agent.context_compressor import ContextCompressor
-from agent.display import (
-    KawaiiSpinner,
-    _detect_tool_failure,
-)
-from agent.display import (
-    build_tool_preview as _build_tool_preview,
-)
-from agent.display import (
-    get_cute_tool_message as _get_cute_tool_message_impl,
-)
-from agent.display import (
-    get_tool_emoji as _get_tool_emoji,
-)
-from agent.error_classifier import FailoverReason, classify_api_error
+from tools.tool_result_storage import maybe_persist_tool_result, enforce_turn_budget
+from tools.interrupt import set_interrupt as _set_interrupt
+from tools.browser_tool import cleanup_browser
+
 
 # Agent internals extracted to agent/ package for modularity
-from agent.memory_manager import (
-    StreamingContextScrubber,
-    build_memory_context_block,
-    sanitize_context,
-)
-from agent.message_sanitization import (
-    _SURROGATE_RE,
-    _escape_invalid_chars_in_json_strings,
-    _repair_tool_call_arguments,
-    _sanitize_messages_non_ascii,
-    _sanitize_messages_surrogates,
-    _sanitize_structure_non_ascii,
-    _sanitize_structure_surrogates,
-    _sanitize_surrogates,
-    _sanitize_tools_non_ascii,
-    _strip_images_from_messages,
-    _strip_non_ascii,
-)
-from agent.model_metadata import (
-    estimate_messages_tokens_rough,
-    estimate_request_tokens_rough,
-    estimate_tokens_rough,
-    fetch_model_metadata,
-    get_next_probe_tier,
-    is_local_endpoint,
-    parse_available_output_tokens_from_error,
-    parse_context_limit_from_error,
-    query_ollama_num_ctx,
-    save_context_length,
-)
+from agent.memory_manager import StreamingContextScrubber, build_memory_context_block, sanitize_context
+from agent.think_scrubber import StreamingThinkScrubber
+from agent.retry_utils import jittered_backoff
+from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
-    DEFAULT_AGENT_IDENTITY,
-    DEVELOPER_ROLE_MODELS,
-    GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
+    DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
+    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
-    MEMORY_GUIDANCE,
-    OPENAI_MODEL_EXECUTION_GUIDANCE,
-    PLATFORM_HINTS,
-    SESSION_SEARCH_GUIDANCE,
-    SKILLS_GUIDANCE,
-    TOOL_USE_ENFORCEMENT_GUIDANCE,
-    TOOL_USE_ENFORCEMENT_MODELS,
-    build_context_files_prompt,
-    build_environment_hints,
     build_nous_subscription_prompt,
-    build_skills_system_prompt,
-    load_soul_md,
 )
+from agent.model_metadata import (
+    fetch_model_metadata,
+    estimate_tokens_rough, estimate_messages_tokens_rough, estimate_request_tokens_rough,
+    get_next_probe_tier, parse_context_limit_from_error,
+    parse_available_output_tokens_from_error,
+    save_context_length, is_local_endpoint,
+    query_ollama_num_ctx,
+)
+from agent.context_compressor import ContextCompressor
+from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
-from agent.retry_utils import jittered_backoff
-from agent.think_scrubber import StreamingThinkScrubber
-from agent.tool_dispatch_helpers import (
-    _DESTRUCTIVE_PATTERNS,
-    _NEVER_PARALLEL_TOOLS,
-    _PARALLEL_SAFE_TOOLS,
-    _PATH_SCOPED_TOOLS,
-    _REDIRECT_OVERWRITE,
-    _append_subdir_hint_to_multimodal,
-    _extract_error_preview,
-    _extract_file_mutation_targets,
-    _extract_parallel_scope_path,
-    _is_destructive_command,
-    _is_multimodal_tool_result,
-    _multimodal_text_summary,
-    _paths_overlap,
-    _should_parallelize_tool_batch,
-    _trajectory_normalize_msg,
+from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.codex_responses_adapter import (
+    _derive_responses_function_call_id as _codex_derive_responses_function_call_id,
+    _deterministic_call_id as _codex_deterministic_call_id,
+    _split_responses_tool_id as _codex_split_responses_tool_id,
+    _summarize_user_message_for_log,
+)
+from agent.display import (
+    KawaiiSpinner, build_tool_preview as _build_tool_preview,
+    get_cute_tool_message as _get_cute_tool_message_impl,
+    _detect_tool_failure,
+    get_tool_emoji as _get_tool_emoji,
 )
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig,
@@ -207,38 +165,46 @@ from agent.tool_guardrails import (
 )
 from agent.tool_result_classification import (
     FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
-)
-from agent.tool_result_classification import (
     file_mutation_result_landed,
 )
 from agent.trajectory import (
+    convert_scratchpad_to_think, has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from agent.usage_pricing import estimate_usage_cost, normalize_usage
+from agent.message_sanitization import (
+    _SURROGATE_RE,
+    _sanitize_surrogates,
+    _sanitize_structure_surrogates,
+    _sanitize_messages_surrogates,
+    _escape_invalid_chars_in_json_strings,
+    _repair_tool_call_arguments,
+    _strip_non_ascii,
+    _sanitize_messages_non_ascii,
+    _sanitize_tools_non_ascii,
+    _strip_images_from_messages,
+    _sanitize_structure_non_ascii,
+)
+from agent.tool_dispatch_helpers import (
+    _NEVER_PARALLEL_TOOLS,
+    _PARALLEL_SAFE_TOOLS,
+    _PATH_SCOPED_TOOLS,
+    _DESTRUCTIVE_PATTERNS,
+    _REDIRECT_OVERWRITE,
+    _is_destructive_command,
+    _should_parallelize_tool_batch,
+    _extract_parallel_scope_path,
+    _paths_overlap,
+    _is_multimodal_tool_result,
+    _multimodal_text_summary,
+    _append_subdir_hint_to_multimodal,
+    _extract_file_mutation_targets,
+    _extract_error_preview,
+    _trajectory_normalize_msg,
+)
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
-from tools.browser_tool import cleanup_browser
-from tools.interrupt import set_interrupt as _set_interrupt
-from tools.terminal_tool import (
-    _get_approval_callback,
-    _get_sudo_password_callback,
-    cleanup_vm,
-    get_active_env,
-    is_persistent_env,
-)
-from tools.terminal_tool import (
-    set_approval_callback as _set_approval_callback,
-)
-from tools.terminal_tool import (
-    set_sudo_password_callback as _set_sudo_password_callback,
-)
-from tools.tool_result_storage import enforce_turn_budget, maybe_persist_tool_result
-from utils import (
-    atomic_json_write,
-    base_url_host_matches,
-    base_url_hostname,
-    env_var_enabled,
-    normalize_proxy_url,
-)
+
+
 
 _MAX_TOOL_WORKERS = 8
 
@@ -752,9 +718,7 @@ class AIAgent:
 
     # Stream-diagnostic class header preserved for backward compat —
     # actual list lives in ``agent.stream_diag.STREAM_DIAG_HEADERS``.
-    from agent.stream_diag import (
-        STREAM_DIAG_HEADERS as _STREAM_DIAG_HEADERS,  # noqa: E402
-    )
+    from agent.stream_diag import STREAM_DIAG_HEADERS as _STREAM_DIAG_HEADERS  # noqa: E402
 
     @staticmethod
     def _stream_diag_init() -> Dict[str, Any]:
@@ -1130,9 +1094,9 @@ class AIAgent:
     # Background memory/skill review — prompts live in agent.background_review
     # ------------------------------------------------------------------
     from agent.background_review import (
-        _COMBINED_REVIEW_PROMPT,
         _MEMORY_REVIEW_PROMPT,
         _SKILL_REVIEW_PROMPT,
+        _COMBINED_REVIEW_PROMPT,
     )
 
     @staticmethod
@@ -2431,9 +2395,8 @@ class AIAgent:
     @staticmethod
     def _build_keepalive_http_client(base_url: str = "") -> Any:
         try:
-            import socket as _socket
-
             import httpx as _httpx
+            import socket as _socket
 
             _sock_opts = [(_socket.SOL_SOCKET, _socket.SO_KEEPALIVE, 1)]
             if hasattr(_socket, "TCP_KEEPIDLE"):
@@ -2764,10 +2727,7 @@ class AIAgent:
             return False
 
         try:
-            from agent.anthropic_adapter import (
-                build_anthropic_client,
-                resolve_anthropic_token,
-            )
+            from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
 
             new_token = resolve_anthropic_token()
         except Exception as exc:
@@ -2852,7 +2812,7 @@ class AIAgent:
         runtime_base = getattr(entry, "runtime_base_url", None) or getattr(entry, "base_url", None) or self.base_url
 
         if self.api_mode == "anthropic_messages":
-            from agent.anthropic_adapter import _is_oauth_token, build_anthropic_client
+            from agent.anthropic_adapter import build_anthropic_client, _is_oauth_token
 
             try:
                 self._anthropic_client.close()

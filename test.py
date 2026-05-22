@@ -12,13 +12,13 @@ if __name__ == "__main__":
     base_url = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     model = "qwen3.5-plus"
     main(
-        query="今天上海天气怎么样？",
+        query="今天上海天气怎么样？另外有哪些新闻？",
         model=model,
         api_key=api_key,
         base_url=base_url,
         # list_tools=True,
         verbose=True,
-        enabled_toolsets="file, vision, web, terminal, safe, research, development"
+        enabled_toolsets="file, vision, web, terminal, safe, research, development, process, memory, browser, computer_use, skill_manager"
     )
 
     print("Done")
