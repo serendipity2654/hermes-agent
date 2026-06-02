@@ -3916,7 +3916,8 @@ def main(
     save_trajectories: bool = False,
     save_sample: bool = False,
     verbose: bool = False,
-    log_prefix_chars: int = 20
+    log_prefix_chars: int = 20,
+    session_id: str = None,
 ):
     """
     Main function for running the agent directly.
@@ -4054,7 +4055,8 @@ def main(
             disabled_toolsets=disabled_toolsets_list,
             save_trajectories=save_trajectories,
             verbose_logging=verbose,
-            log_prefix_chars=log_prefix_chars
+            log_prefix_chars=log_prefix_chars,
+            session_id=session_id
         )
     except RuntimeError as e:
         print(f"❌ Failed to initialize agent: {e}")
